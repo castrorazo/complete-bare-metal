@@ -6,6 +6,7 @@
 */
 
 #include <stdint.h>
+#include <string.h>  /* Added for strcmp() */
 #include "stm32f411xe.h"
 
 /* GPIO and Peripheral Definitions */
@@ -21,6 +22,8 @@
 #define SYS_FREQ        16000000
 #define APB1_CLK        SYS_FREQ
 #define UART_BRR_VAL    ((APB1_CLK + (UART_BAUDRATE/2U))/UART_BAUDRATE)
+#define UART_BUFFER_SIZE 32
+
 
 /* Timer Settings
  * System clock = 16MHz
@@ -66,6 +69,14 @@ static void pattern_breath(uint32_t period_ms);
 static void pattern_morse_sos(uint32_t period_ms);
 static void pattern_double(uint32_t period_ms);
 static void error_indication(void);
+/* Add these new global variables */
+static volatile char uart_rx_buffer[UART_BUFFER_SIZE];
+static volatile uint8_t uart_rx_index = 0;
+static volatile uint8_t uart_command_ready = 0;
+
+/* Add these new function prototypes */
+static void process_uart_command(void);
+static void uart_write_char(char c);
 
 /* Debug strings */
 static const char* pattern_names[] = {
@@ -99,6 +110,7 @@ int main(void)
 
     /* Send initial message */
     uart_write("LED Control Program Started\r\n");
+    uart_write("Type 'help' for available commands\r\n");
     uart_write("Current Pattern: STEADY\r\n");
     uart_write("Current Speed Level: 0\r\n");
 
@@ -110,6 +122,11 @@ int main(void)
 
     while(1)
     {
+    	/* Check for UART commands */
+    	if (uart_command_ready)
+    	{
+    	    process_uart_command();
+    	}
         btn_state = check_button();
 
         switch(btn_state)
@@ -357,11 +374,79 @@ static void pattern_double(uint32_t period_ms)
 }
 
 /**
+ * @brief USART2 Interrupt Handler
+ */
+void USART2_IRQHandler(void)
+{
+    if (USART2->SR & (1U<<5))  // If RXNE flag is set
+    {
+        char rx_char = (char)(USART2->DR & 0xFF);
+
+        if (rx_char == '\r' || rx_char == '\n')  // End of command
+        {
+            if (uart_rx_index > 0)
+            {
+                uart_rx_buffer[uart_rx_index] = '\0';  // Null terminate
+                uart_command_ready = 1;
+                uart_rx_index = 0;
+            }
+        }
+        else if (uart_rx_index < UART_BUFFER_SIZE - 1)  // Store character
+        {
+            uart_rx_buffer[uart_rx_index++] = rx_char;
+            uart_write_char(rx_char);  // Echo character back
+        }
+    }
+}
+
+/**
+ * @brief Process received UART command
+ */
+static void process_uart_command(void)
+{
+    if (strcmp((char*)uart_rx_buffer, "next") == 0)
+    {
+        g_current_pattern = (g_current_pattern + 1) % MAX_PATTERNS;
+        uart_write("Pattern Changed to: ");
+        uart_write(pattern_names[g_current_pattern]);
+    }
+    else if (strcmp((char*)uart_rx_buffer, "speed") == 0)
+    {
+        g_speed_level = (g_speed_level + 1) % 4;
+        uart_write("Speed Level Changed to: ");
+        uart_write_num(g_speed_level);
+        uart_write("\r\n");
+    }
+    else if (strcmp((char*)uart_rx_buffer, "help") == 0)
+    {
+        uart_write("\r\nAvailable commands:\r\n");
+        uart_write("next  - Change to next pattern\r\n");
+        uart_write("speed - Change speed level\r\n");
+        uart_write("help  - Show this help message\r\n");
+    }
+    else
+    {
+        uart_write("Unknown command. Type 'help' for available commands.\r\n");
+    }
+    uart_command_ready = 0;
+}
+
+/**
+ * @brief Send single character over UART
+ */
+static void uart_write_char(char c)
+{
+    while(!(USART2->SR & (1U<<7)));  // Wait until transmit buffer is empty
+    USART2->DR = (c & 0xFF);
+}
+
+/**
  * @brief Error indication pattern
  */
 /**
  * @brief Initialize UART for debug output
  */
+/* Modify uart_init() function */
 static void uart_init(void)
 {
     /* Enable UART clock */
@@ -373,8 +458,11 @@ static void uart_init(void)
     USART2->CR1 |= (1U<<13);     // Enable UART
     USART2->CR1 |= (1U<<3);      // Enable Transmitter
     USART2->CR1 |= (1U<<2);      // Enable Receiver
-}
+    USART2->CR1 |= (1U<<5);      // Enable RXNE interrupt
 
+    /* Enable USART2 interrupt in NVIC */
+    NVIC_EnableIRQ(USART2_IRQn);
+}
 /**
  * @brief Send string over UART
  */
